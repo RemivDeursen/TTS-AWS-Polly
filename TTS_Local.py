@@ -1,4 +1,5 @@
 import io
+import sys
 from pathlib import Path
 import csv
 import queue
@@ -202,7 +203,17 @@ def prepare_for_playback(audio, channels):
 
 
 def load_aws_credentials():
-    credentials_path = Path(__file__).with_name("rootkey.csv")
+    search_paths = [
+        Path(__file__).with_name("rootkey.csv"),
+        Path(sys.executable).with_name("rootkey.csv"),
+    ]
+
+    credentials_path = next((path for path in search_paths if path.exists()), None)
+    if credentials_path is None:
+        raise FileNotFoundError(
+            "Missing AWS credentials file. Place rootkey.csv next to TTS_Local.py "
+            "or next to the built executable."
+        )
 
     with credentials_path.open(newline="", encoding="utf-8-sig") as file:
         reader = csv.DictReader(file)

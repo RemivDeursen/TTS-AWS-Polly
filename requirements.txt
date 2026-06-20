@@ -1,0 +1,6 @@
+boto3
+numpy
+sounddevice
+soundfile
+soxr
+pyinstaller

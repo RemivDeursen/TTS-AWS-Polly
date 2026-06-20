@@ -78,7 +78,7 @@ def format_output_device(device):
 
 
 def get_default_output_device_index():
-    default_input, default_output = sd.default.device
+    _default_input, default_output = sd.default.device
     if default_output is None or default_output < 0:
         return None
     return int(default_output)
@@ -238,14 +238,6 @@ def speak_text(text, output_device_index, engine, stop_event):
     if stop_event.is_set():
         return
 
-    print("Output Device:", output_device["index"], output_device["name"])
-    print("Polly Engine:", engine)
-    print("Polly Sample Rate:", polly_sample_rate)
-    print("Playback Sample Rate:", playback_sample_rate)
-    print("Playback Channels:", playback_channels)
-    print("Peak:", np.max(np.abs(audio)) if audio.size else 0.0)
-    print("Shape:", audio.shape)
-
     sd.play(
         audio,
         playback_sample_rate,
@@ -262,7 +254,6 @@ class TTSApp(tk.Tk):
         self.title("Local TTS")
         self.geometry("560x260")
         self.minsize(440, 220)
-        self.speaking = False
         self.output_devices = []
         self.stop_event = threading.Event()
         self.message_queue = queue.Queue()
@@ -373,7 +364,6 @@ class TTSApp(tk.Tk):
         self.textbox.focus_set()
 
     def set_speaking(self, speaking):
-        self.speaking = speaking
         self.speak_button.configure(state="normal")
         self.clear_button.configure(state="normal")
         self.stop_button.configure(state="normal" if speaking else "disabled")
@@ -442,7 +432,6 @@ class TTSApp(tk.Tk):
         while True:
             try:
                 self.message_queue.get_nowait()
-                self.message_queue.task_done()
             except queue.Empty:
                 return
 
@@ -459,7 +448,6 @@ class TTSApp(tk.Tk):
                 queued_after_this = self.message_queue.qsize()
                 self.after(0, self.update_playback_status, queued_after_this)
                 speak_text(text, output_device_index, engine, stop_event)
-                self.message_queue.task_done()
         except Exception as exc:
             stop_event.set()
             self.clear_queue()

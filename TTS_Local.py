@@ -32,10 +32,43 @@ PLAYBACK_HEADROOM_DB = 1.0
 PLAYBACK_HEADROOM = 10 ** (-PLAYBACK_HEADROOM_DB / 20)
 
 
+class AudioDeviceError(RuntimeError):
+    pass
+
+
+def describe_portaudio_error(exc):
+    message = str(exc)
+    if "-9999" in message or "Unanticipated host error" in message:
+        return (
+            "Windows reported an audio host error while opening the output device. "
+            "Try another output device, unplug/replug the audio device, restart apps "
+            "using the device, or disable exclusive mode in Windows sound settings.\n\n"
+            f"PortAudio details: {message}"
+        )
+    return message
+
+
+def safe_query_devices():
+    try:
+        return sd.query_devices()
+    except sd.PortAudioError as exc:
+        raise AudioDeviceError(
+            "Could not read Windows output devices.\n\n"
+            f"{describe_portaudio_error(exc)}"
+        ) from exc
+
+
+def safe_query_hostapi(hostapi_index):
+    try:
+        return sd.query_hostapis(hostapi_index)["name"]
+    except sd.PortAudioError:
+        return "Unknown host API"
+
+
 def find_output_device_index(device_name, fallback_index):
     matches = []
 
-    for index, device in enumerate(sd.query_devices()):
+    for index, device in enumerate(safe_query_devices()):
         if device["max_output_channels"] <= 0:
             continue
         if device_name.lower() in device["name"].lower():
@@ -43,8 +76,7 @@ def find_output_device_index(device_name, fallback_index):
 
     if matches:
         for index, device in matches:
-            hostapi = sd.query_hostapis(device["hostapi"])
-            if "WASAPI" in hostapi["name"]:
+            if "WASAPI" in safe_query_hostapi(device["hostapi"]):
                 return index
         return matches[0][0]
 
@@ -54,15 +86,14 @@ def find_output_device_index(device_name, fallback_index):
 def get_output_device_options():
     devices = []
 
-    for index, device in enumerate(sd.query_devices()):
+    for index, device in enumerate(safe_query_devices()):
         if device["max_output_channels"] <= 0:
             continue
 
-        hostapi = sd.query_hostapis(device["hostapi"])
         devices.append({
             "index": index,
             "name": device["name"],
-            "hostapi": hostapi["name"],
+            "hostapi": safe_query_hostapi(device["hostapi"]),
             "max_channels": int(device["max_output_channels"]),
             "sample_rate": int(device["default_samplerate"]),
         })
@@ -79,7 +110,11 @@ def format_output_device(device):
 
 
 def get_default_output_device_index():
-    _default_input, default_output = sd.default.device
+    try:
+        _default_input, default_output = sd.default.device
+    except sd.PortAudioError:
+        return None
+
     if default_output is None or default_output < 0:
         return None
     return int(default_output)
@@ -103,7 +138,14 @@ def choose_initial_output_device(devices):
 
 
 def get_output_device_info(device_index):
-    device = sd.query_devices(device_index, "output")
+    try:
+        device = sd.query_devices(device_index, "output")
+    except sd.PortAudioError as exc:
+        raise AudioDeviceError(
+            f"Could not open output device {device_index}.\n\n"
+            f"{describe_portaudio_error(exc)}"
+        ) from exc
+
     return {
         "index": device_index,
         "name": device["name"],
@@ -120,6 +162,8 @@ def get_output_channels(device_info):
         if 0 < channels <= device_info["max_channels"]
     ))
 
+    errors = []
+
     for channels in candidates:
         try:
             sd.check_output_settings(
@@ -128,12 +172,13 @@ def get_output_channels(device_info):
                 channels=channels
             )
             return channels
-        except sd.PortAudioError:
-            pass
+        except sd.PortAudioError as exc:
+            errors.append(f"{channels}ch: {describe_portaudio_error(exc)}")
 
-    raise RuntimeError(
+    detail = "\n".join(errors) if errors else "No channel counts were available."
+    raise AudioDeviceError(
         f"No valid channel count found for output device {device_info['index']} "
-        f"({device_info['name']})."
+        f"({device_info['name']}).\n\n{detail}"
     )
 
 
@@ -249,13 +294,22 @@ def speak_text(text, output_device_index, engine, stop_event):
     if stop_event.is_set():
         return
 
-    sd.play(
-        audio,
-        playback_sample_rate,
-        device=output_device["index"]
-    )
-
-    sd.wait()
+    try:
+        sd.play(
+            audio,
+            playback_sample_rate,
+            device=output_device["index"]
+        )
+        sd.wait()
+    except sd.PortAudioError as exc:
+        try:
+            sd.stop()
+        except sd.PortAudioError:
+            pass
+        raise AudioDeviceError(
+            f"Could not play audio through {output_device['name']}.\n\n"
+            f"{describe_portaudio_error(exc)}"
+        ) from exc
 
 
 class TTSApp(tk.Tk):
@@ -336,7 +390,17 @@ class TTSApp(tk.Tk):
         return self.textbox.get("1.0", "end").strip()
 
     def refresh_output_devices(self):
-        self.output_devices = get_output_device_options()
+        try:
+            self.output_devices = get_output_device_options()
+        except AudioDeviceError as exc:
+            self.output_devices = []
+            self.device_combo.configure(values=[])
+            self.device_choice.set("")
+            self.status.set("Audio device error")
+            self.speak_button.configure(state="disabled")
+            self.after(0, self.show_error, exc)
+            return
+
         labels = [format_output_device(device) for device in self.output_devices]
         self.device_combo.configure(values=labels)
 
@@ -436,7 +500,10 @@ class TTSApp(tk.Tk):
 
         self.stop_event.set()
         self.clear_queue()
-        sd.stop()
+        try:
+            sd.stop()
+        except sd.PortAudioError:
+            pass
         self.status.set("Stopping...")
 
     def clear_queue(self):

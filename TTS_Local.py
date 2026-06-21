@@ -28,6 +28,9 @@ POLLY_OGG_SAMPLE_RATES_BY_ENGINE = {
     "standard": (22050, 24000, 16000, 8000),
 }
 POLLY_ENGINE_OPTIONS = tuple(POLLY_OGG_SAMPLE_RATES_BY_ENGINE)
+COMMON_OUTPUT_SAMPLE_RATES = (48000, 44100, 96000, 88200, 32000, 24000, 22050, 16000, 8000)
+PREFERRED_CABLE_SAMPLE_RATE = 48000
+PREFERRED_CABLE_CHANNELS = 2
 PLAYBACK_HEADROOM_DB = 1.0
 PLAYBACK_HEADROOM = 10 ** (-PLAYBACK_HEADROOM_DB / 20)
 
@@ -65,22 +68,26 @@ def safe_query_hostapi(hostapi_index):
         return "Unknown host API"
 
 
-def find_output_device_index(device_name, fallback_index):
-    matches = []
+def hostapi_preference(hostapi_name):
+    if "WASAPI" in hostapi_name:
+        return 0
+    if "DirectSound" in hostapi_name or "MME" in hostapi_name:
+        return 1
+    if "WDM-KS" in hostapi_name:
+        return 2
+    return 3
 
-    for index, device in enumerate(safe_query_devices()):
-        if device["max_output_channels"] <= 0:
-            continue
-        if device_name.lower() in device["name"].lower():
-            matches.append((index, device))
 
-    if matches:
-        for index, device in matches:
-            if "WASAPI" in safe_query_hostapi(device["hostapi"]):
-                return index
-        return matches[0][0]
-
-    return fallback_index
+def can_open_output_format(device_index, sample_rate, channels):
+    try:
+        sd.check_output_settings(
+            device=device_index,
+            samplerate=sample_rate,
+            channels=channels
+        )
+        return True
+    except sd.PortAudioError:
+        return False
 
 
 def get_output_device_options():
@@ -122,7 +129,7 @@ def get_default_output_device_index():
 
 def choose_initial_output_device(devices):
     device_indexes = {device["index"] for device in devices}
-    cable_index = find_output_device_index(VB_CABLE_DEVICE_NAME, -1)
+    cable_index = choose_preferred_cable_output_device(devices)
 
     if cable_index in device_indexes:
         return cable_index
@@ -154,32 +161,80 @@ def get_output_device_info(device_index):
     }
 
 
-def get_output_channels(device_info):
-    candidates = [2, device_info["max_channels"], 1, 4, 8]
-    candidates = list(dict.fromkeys(
+def get_output_channel_candidates(max_channels):
+    candidates = [2, max_channels, 1, 4, 8]
+    return list(dict.fromkeys(
         channels
         for channels in candidates
-        if 0 < channels <= device_info["max_channels"]
+        if 0 < channels <= max_channels
     ))
 
+
+def get_output_sample_rate_candidates(default_sample_rate):
+    candidates = [*COMMON_OUTPUT_SAMPLE_RATES, default_sample_rate]
+    return list(dict.fromkeys(rate for rate in candidates if rate > 0))
+
+
+def detect_output_format(device_info):
+    sample_rates = get_output_sample_rate_candidates(device_info["sample_rate"])
+    channels_by_preference = get_output_channel_candidates(device_info["max_channels"])
     errors = []
 
-    for channels in candidates:
-        try:
-            sd.check_output_settings(
-                device=device_info["index"],
-                samplerate=device_info["sample_rate"],
-                channels=channels
-            )
-            return channels
-        except sd.PortAudioError as exc:
-            errors.append(f"{channels}ch: {describe_portaudio_error(exc)}")
+    for sample_rate in sample_rates:
+        for channels in channels_by_preference:
+            try:
+                sd.check_output_settings(
+                    device=device_info["index"],
+                    samplerate=sample_rate,
+                    channels=channels
+                )
+                return sample_rate, channels
+            except sd.PortAudioError as exc:
+                errors.append(
+                    f"{sample_rate}Hz/{channels}ch: {describe_portaudio_error(exc)}"
+                )
 
-    detail = "\n".join(errors) if errors else "No channel counts were available."
+    detail = "\n".join(errors) if errors else "No sample rates or channel counts were available."
     raise AudioDeviceError(
-        f"No valid channel count found for output device {device_info['index']} "
+        f"No valid output format found for device {device_info['index']} "
         f"({device_info['name']}).\n\n{detail}"
     )
+
+
+def choose_preferred_cable_output_device(devices):
+    matches = [
+        device for device in devices
+        if VB_CABLE_DEVICE_NAME.lower() in device["name"].lower()
+    ]
+    if not matches:
+        return None
+
+    matches.sort(key=lambda device: (
+        hostapi_preference(device["hostapi"]),
+        device["index"]
+    ))
+
+    for device in matches:
+        if can_open_output_format(
+            device["index"],
+            PREFERRED_CABLE_SAMPLE_RATE,
+            PREFERRED_CABLE_CHANNELS
+        ):
+            return device["index"]
+
+    for device in matches:
+        try:
+            detect_output_format({
+                "index": device["index"],
+                "name": device["name"],
+                "sample_rate": device["sample_rate"],
+                "max_channels": device["max_channels"],
+            })
+            return device["index"]
+        except AudioDeviceError:
+            continue
+
+    return None
 
 
 def synthesize_polly_ogg(text, engine):
@@ -278,8 +333,7 @@ polly = boto3.client(
 def speak_text(text, output_device_index, engine, stop_event):
     audio, polly_sample_rate = synthesize_polly_ogg(text, engine)
     output_device = get_output_device_info(output_device_index)
-    playback_sample_rate = output_device["sample_rate"]
-    playback_channels = get_output_channels(output_device)
+    playback_sample_rate, playback_channels = detect_output_format(output_device)
 
     if playback_sample_rate != polly_sample_rate:
         audio = soxr.resample(
@@ -317,13 +371,16 @@ class TTSApp(tk.Tk):
         super().__init__()
 
         self.title("Local TTS")
-        self.geometry("560x260")
-        self.minsize(440, 220)
+        self.geometry("560x220")
+        self.minsize(440, 200)
         self.output_devices = []
+        self.settings_window = None
         self.stop_event = threading.Event()
         self.message_queue = queue.Queue()
         self.worker_running = False
         self.worker_lock = threading.Lock()
+        self.device_choice = tk.StringVar()
+        self.engine_choice = tk.StringVar(value="neural")
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -331,60 +388,39 @@ class TTSApp(tk.Tk):
         frame = ttk.Frame(self, padding=12)
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
-
-        device_label = ttk.Label(frame, text="Output device")
-        device_label.grid(row=0, column=0, sticky="w")
-
-        self.device_choice = tk.StringVar()
-        self.device_combo = ttk.Combobox(
-            frame,
-            textvariable=self.device_choice,
-            state="readonly"
-        )
-        self.device_combo.grid(row=0, column=1, columnspan=3, sticky="ew", padx=(8, 0))
-
-        engine_label = ttk.Label(frame, text="Engine")
-        engine_label.grid(row=1, column=0, sticky="w", pady=(8, 0))
-
-        self.engine_choice = tk.StringVar(value="neural")
-        self.engine_combo = ttk.Combobox(
-            frame,
-            textvariable=self.engine_choice,
-            values=POLLY_ENGINE_OPTIONS,
-            state="readonly"
-        )
-        self.engine_combo.grid(
-            row=1,
-            column=1,
-            columnspan=3,
-            sticky="ew",
-            padx=(8, 0),
-            pady=(8, 0)
-        )
+        frame.rowconfigure(0, weight=1)
 
         self.textbox = tk.Text(frame, height=5, wrap="word", undo=True)
-        self.textbox.grid(row=2, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
+        self.textbox.grid(row=0, column=0, columnspan=5, sticky="nsew")
         self.textbox.focus_set()
 
         self.status = tk.StringVar(value="Ready")
         status_label = ttk.Label(frame, textvariable=self.status)
-        status_label.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        status_label.grid(row=1, column=0, sticky="w", pady=(10, 0))
+
+        self.settings_button = ttk.Button(
+            frame,
+            text="\u2699",
+            width=3,
+            command=self.open_settings
+        )
+        self.settings_button.grid(row=1, column=1, sticky="e", padx=(8, 0), pady=(10, 0))
 
         self.clear_button = ttk.Button(frame, text="Clear", command=self.clear_text)
-        self.clear_button.grid(row=3, column=1, sticky="e", padx=(8, 0), pady=(10, 0))
+        self.clear_button.grid(row=1, column=2, sticky="e", padx=(8, 0), pady=(10, 0))
 
         self.stop_button = ttk.Button(frame, text="Stop", command=self.stop_speaking)
-        self.stop_button.grid(row=3, column=2, sticky="e", padx=(8, 0), pady=(10, 0))
+        self.stop_button.grid(row=1, column=3, sticky="e", padx=(8, 0), pady=(10, 0))
         self.stop_button.configure(state="disabled")
 
         self.speak_button = ttk.Button(frame, text="Speak", command=self.send_current_text)
-        self.speak_button.grid(row=3, column=3, sticky="e", padx=(8, 0), pady=(10, 0))
+        self.speak_button.grid(row=1, column=4, sticky="e", padx=(8, 0), pady=(10, 0))
 
         self.textbox.bind("<Return>", self.speak_from_enter)
         self.textbox.bind("<Shift-Return>", self.insert_newline)
         self.bind("<Escape>", self.stop_from_escape)
         self.refresh_output_devices()
+        self.after(100, self.open_settings)
 
     def get_text(self):
         return self.textbox.get("1.0", "end").strip()
@@ -394,7 +430,6 @@ class TTSApp(tk.Tk):
             self.output_devices = get_output_device_options()
         except AudioDeviceError as exc:
             self.output_devices = []
-            self.device_combo.configure(values=[])
             self.device_choice.set("")
             self.status.set("Audio device error")
             self.speak_button.configure(state="disabled")
@@ -402,7 +437,6 @@ class TTSApp(tk.Tk):
             return
 
         labels = [format_output_device(device) for device in self.output_devices]
-        self.device_combo.configure(values=labels)
 
         initial_index = choose_initial_output_device(self.output_devices)
         if initial_index is None:
@@ -417,6 +451,70 @@ class TTSApp(tk.Tk):
                 self.status.set("Ready")
                 self.speak_button.configure(state="normal")
                 return
+
+    def open_settings(self):
+        if self.worker_running:
+            return
+
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+            self.settings_window.focus_force()
+            return
+
+        settings = tk.Toplevel(self)
+        self.settings_window = settings
+        settings.title("Settings")
+        settings.transient(self)
+        settings.resizable(False, False)
+
+        frame = ttk.Frame(settings, padding=12)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+
+        device_label = ttk.Label(frame, text="Output device")
+        device_label.grid(row=0, column=0, sticky="w")
+
+        labels = [format_output_device(device) for device in self.output_devices]
+        device_combo = ttk.Combobox(
+            frame,
+            textvariable=self.device_choice,
+            values=labels,
+            state="readonly",
+            width=70
+        )
+        device_combo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(8, 0))
+
+        engine_label = ttk.Label(frame, text="Engine")
+        engine_label.grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        engine_combo = ttk.Combobox(
+            frame,
+            textvariable=self.engine_choice,
+            values=POLLY_ENGINE_OPTIONS,
+            state="readonly",
+            width=20
+        )
+        engine_combo.grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        refresh_button = ttk.Button(
+            frame,
+            text="Refresh",
+            command=lambda: self.refresh_settings_devices(device_combo)
+        )
+        refresh_button.grid(row=2, column=1, sticky="e", pady=(12, 0))
+
+        done_button = ttk.Button(frame, text="Done", command=settings.destroy)
+        done_button.grid(row=2, column=2, sticky="e", padx=(8, 0), pady=(12, 0))
+
+        settings.protocol("WM_DELETE_WINDOW", settings.destroy)
+        settings.grab_set()
+        settings.focus_set()
+
+    def refresh_settings_devices(self, device_combo):
+        self.refresh_output_devices()
+        device_combo.configure(
+            values=[format_output_device(device) for device in self.output_devices]
+        )
 
     def get_selected_output_device_index(self):
         selected = self.device_choice.get()
@@ -442,8 +540,7 @@ class TTSApp(tk.Tk):
         self.speak_button.configure(state="normal")
         self.clear_button.configure(state="normal")
         self.stop_button.configure(state="normal" if speaking else "disabled")
-        self.device_combo.configure(state="disabled" if speaking else "readonly")
-        self.engine_combo.configure(state="disabled" if speaking else "readonly")
+        self.settings_button.configure(state="disabled" if speaking else "normal")
         self.status.set("Speaking..." if speaking else "Ready")
 
     def speak_from_enter(self, _event):
@@ -558,4 +655,3 @@ class TTSApp(tk.Tk):
 
 if __name__ == "__main__":
     TTSApp().mainloop()
-

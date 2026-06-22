@@ -7,8 +7,8 @@ hiddenimports = collect_submodules("boto3") + collect_submodules("botocore")
 
 
 a = Analysis(
-    ["TTS_Local.py"],
-    pathex=[],
+    ["apps/local_tts.py"],
+    pathex=["."],
     binaries=[],
     datas=[],
     hiddenimports=hiddenimports,

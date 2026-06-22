@@ -1,1 +1,6 @@
 rootkey.csv
+__pycache__/
+*.py[cod]
+build/
+dist/
+.venv/

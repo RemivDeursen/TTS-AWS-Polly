@@ -1,22 +1,60 @@
-## Step 1: Install VB-CABLE
+## TTS AWS Polly
 
-Download and install:
-[VB-CABLE Virtual Audio Device](https://vb-audio.com/Cable/)
-After installing and rebooting, set Discord's microphone to:
+Small Windows TTS tools that synthesize speech with Amazon Polly and play it through a selected output device, usually VB-CABLE for Discord.
+
+## Project Layout
+
+```text
+apps/
+  local_tts.py
+  discord_clipboard_tts.py
+  discord_enter_tts.py
+
+tts_core/
+  audio.py
+  config.py
+  devices.py
+  polly.py
+
+packaging/
+  TTS_Local.spec
+
+scripts/
+  build.ps1
 ```
+
+`TTS_Local.py` remains as a compatibility launcher for the main local TTS app.
+
+## Install
+
+Install VB-CABLE, then set Discord's microphone to:
+
+```text
 CABLE Output (VB-Audio Virtual Cable)
 ```
-Leave Discord's output device as your normal headset.
----
 
-## Step 2: Install Python packages
-```
-pip install boto3 sounddevice soundfile pydub numpy scipy
-```
-You'll also want FFmpeg:
-[FFmpeg Windows Builds](https://github.com/oop7/ffmpeg-install-guide/releases/tag/v2.6.0)
+Install Python packages:
 
-Verify:
+```powershell
+python -m pip install -r requirements.txt
 ```
-ffmpeg -version
+
+Place `rootkey.csv` in the project root.
+
+## Run
+
+```powershell
+python TTS_Local.py
+python apps/discord_clipboard_tts.py
+python apps/discord_enter_tts.py
 ```
+
+The Discord Enter script needs Windows UI Automation access through `pywinauto`; if Discord does not expose its focused textbox text, use the clipboard script instead.
+
+## Build
+
+```powershell
+.\scripts\build.ps1
+```
+
+Place `rootkey.csv` next to the built executable before running it.

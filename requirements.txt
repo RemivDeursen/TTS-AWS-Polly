@@ -4,3 +4,4 @@ sounddevice
 soundfile
 soxr
 pyinstaller
+pywinauto

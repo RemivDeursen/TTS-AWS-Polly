@@ -1,14 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+
 from PyInstaller.utils.hooks import collect_submodules
 
 
+project_root = os.path.abspath(os.path.join(SPECPATH, os.pardir))
 hiddenimports = collect_submodules("boto3") + collect_submodules("botocore")
+hiddenimports += [
+    "pywinauto.controls.uiawrapper",
+    "pywinauto.uia_defines",
+]
 
 
 a = Analysis(
-    ["apps/local_tts.py"],
-    pathex=["."],
+    [os.path.join(project_root, "apps", "local_tts.py")],
+    pathex=[project_root],
     binaries=[],
     datas=[],
     hiddenimports=hiddenimports,

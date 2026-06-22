@@ -7,13 +7,12 @@ Small Windows TTS tools that synthesize speech with Amazon Polly and play it thr
 ```text
 apps/
   local_tts.py
-  discord_clipboard_tts.py
-  discord_enter_tts.py
 
 tts_core/
   audio.py
   config.py
   devices.py
+  discord_monitor.py
   polly.py
 
 packaging/
@@ -44,12 +43,12 @@ Place `rootkey.csv` in the project root.
 ## Run
 
 ```powershell
-python TTS_Local.py
-python apps/discord_clipboard_tts.py
-python apps/discord_enter_tts.py
+.\scripts\run.ps1
 ```
 
-The Discord Enter script needs Windows UI Automation access through `pywinauto`; if Discord does not expose its focused textbox text, use the clipboard script instead.
+The main app has a Discord toggle. When it is enabled, the app watches for Enter while Discord is active and tries to read the focused Discord textbox through Windows UI Automation.
+
+Enable `Listen` to also play synthesized speech through your selected Windows audio device while the main output device, usually VB-CABLE, receives the same audio. Use settings to choose both the main output device and the listen device.
 
 ## Build
 

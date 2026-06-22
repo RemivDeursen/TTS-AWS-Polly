@@ -1,3 +1,5 @@
+import threading
+
 import numpy as np
 import sounddevice as sd
 
@@ -16,6 +18,9 @@ from .devices import (
     get_output_device_info,
 )
 from .polly import synthesize_polly_ogg
+
+
+PLAYBACK_BLOCK_FRAMES = 2048
 
 
 def match_output_channels(audio, channels):
@@ -51,31 +56,47 @@ def prepare_for_playback(audio, channels):
     return np.ascontiguousarray(np.clip(audio, -1.0, 1.0), dtype=np.float32)
 
 
-def speak_text(text, output_device_index, engine, stop_event):
-    audio, polly_sample_rate = synthesize_polly_ogg(text, engine)
+def build_playback_job(audio, source_sample_rate, output_device_index):
+    audio = np.array(audio, copy=True)
     output_device = get_output_device_info(output_device_index)
     playback_sample_rate, playback_channels = detect_output_format(output_device)
 
-    if playback_sample_rate != polly_sample_rate:
+    if playback_sample_rate != source_sample_rate:
         audio = soxr.resample(
             audio,
-            polly_sample_rate,
+            source_sample_rate,
             playback_sample_rate,
             quality="HQ"
         )
 
-    audio = prepare_for_playback(audio, playback_channels)
+    return {
+        "audio": prepare_for_playback(audio, playback_channels),
+        "device": output_device,
+        "sample_rate": playback_sample_rate,
+        "channels": playback_channels,
+    }
+
+
+def play_prepared_audio(job, stop_event):
+    output_device = job["device"]
+    audio = job["audio"]
 
     if stop_event.is_set():
         return
 
     try:
-        sd.play(
-            audio,
-            playback_sample_rate,
-            device=output_device["index"]
-        )
-        sd.wait()
+        with sd.OutputStream(
+            samplerate=job["sample_rate"],
+            device=output_device["index"],
+            channels=job["channels"],
+            dtype="float32",
+        ) as stream:
+            for start in range(0, len(audio), PLAYBACK_BLOCK_FRAMES):
+                if stop_event.is_set():
+                    stream.abort()
+                    return
+
+                stream.write(audio[start:start + PLAYBACK_BLOCK_FRAMES])
     except sd.PortAudioError as exc:
         try:
             sd.stop()
@@ -85,3 +106,46 @@ def speak_text(text, output_device_index, engine, stop_event):
             f"Could not play audio through {output_device['name']}.\n\n"
             f"{describe_portaudio_error(exc)}"
         ) from exc
+
+
+def speak_text(text, output_device_index, engine, stop_event, monitor_device_index=None):
+    audio, polly_sample_rate = synthesize_polly_ogg(text, engine)
+    device_indexes = [output_device_index]
+
+    if monitor_device_index is not None and monitor_device_index not in device_indexes:
+        device_indexes.append(monitor_device_index)
+
+    playback_jobs = [
+        build_playback_job(audio, polly_sample_rate, device_index)
+        for device_index in device_indexes
+    ]
+
+    if stop_event.is_set():
+        return
+
+    if len(playback_jobs) == 1:
+        play_prepared_audio(playback_jobs[0], stop_event)
+        return
+
+    errors = []
+
+    def play_job(job):
+        try:
+            play_prepared_audio(job, stop_event)
+        except Exception as exc:
+            errors.append(exc)
+            stop_event.set()
+
+    threads = [
+        threading.Thread(target=play_job, args=(job,), daemon=True)
+        for job in playback_jobs
+    ]
+
+    for thread in threads:
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    if errors:
+        raise errors[0]

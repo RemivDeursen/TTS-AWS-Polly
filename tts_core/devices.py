@@ -118,6 +118,16 @@ def choose_initial_output_device(devices):
     return devices[0]["index"] if devices else None
 
 
+def choose_initial_monitor_output_device(devices):
+    device_indexes = {device["index"] for device in devices}
+    default_index = get_default_output_device_index()
+
+    if default_index in device_indexes:
+        return default_index
+
+    return devices[0]["index"] if devices else None
+
+
 def get_output_device_info(device_index):
     try:
         device = sd.query_devices(device_index, "output")

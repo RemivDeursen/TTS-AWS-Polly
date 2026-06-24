@@ -17,7 +17,7 @@ a = Analysis(
     [os.path.join(project_root, "apps", "local_tts.py")],
     pathex=[project_root],
     binaries=[],
-    datas=[],
+    datas=[(os.path.join(project_root, "cat_lexicon.pls"), ".")],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

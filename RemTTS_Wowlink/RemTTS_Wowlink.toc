@@ -1,0 +1,8 @@
+## Interface: 120100, 120005, 120007
+## Title: RemTTS WoWLink
+## Notes: Optional in-game helper for RemTTS WoWLink.
+## Author: RemTTS
+## Version: 0.1.0
+## SavedVariables: RemTTS_WowlinkDB
+
+RemTTS_Wowlink.lua

@@ -155,8 +155,7 @@ def get_output_channel_candidates(max_channels):
 
 
 def get_output_sample_rate_candidates(default_sample_rate):
-    candidates = [*COMMON_OUTPUT_SAMPLE_RATES, default_sample_rate]
-    return list(dict.fromkeys(rate for rate in candidates if rate > 0))
+    return list(dict.fromkeys(rate for rate in COMMON_OUTPUT_SAMPLE_RATES if rate > 0))
 
 
 def detect_output_format(device_info):

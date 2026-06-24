@@ -3,6 +3,7 @@ import ctypes
 
 POLL_INTERVAL_MS = 25
 VK_RETURN = 0x0D
+VK_SCROLL = 0x91
 
 
 def get_foreground_window_title():
@@ -22,6 +23,10 @@ def get_foreground_window_title():
 
 def discord_is_foreground():
     return "discord" in get_foreground_window_title().lower()
+
+
+def scroll_lock_is_on():
+    return bool(ctypes.windll.user32.GetKeyState(VK_SCROLL) & 0x0001)
 
 
 def return_key_is_down():

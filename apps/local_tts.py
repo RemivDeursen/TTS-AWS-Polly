@@ -1,4 +1,5 @@
 import queue
+import re
 import sys
 import threading
 import tkinter as tk
@@ -17,6 +18,12 @@ from tts_core.discord_monitor import (
     discord_is_foreground,
     get_focused_uia_text,
     return_key_is_down,
+    scroll_lock_is_on,
+)
+from tts_core.wowlink import (
+    WOWLINK_POLL_INTERVAL_MS,
+    WowKeyboardCapture,
+    wow_is_foreground,
 )
 from tts_core.devices import (
     AudioDeviceError,
@@ -27,13 +34,23 @@ from tts_core.devices import (
 )
 
 
+URL_START_RE = re.compile(
+    r"^\s*(?:https?://|www\.|(?:[a-z0-9][a-z0-9-]*\.)+[a-z]{2,}(?:[/?#:]|$))",
+    re.IGNORECASE,
+)
+
+
+def starts_with_url(text):
+    return bool(URL_START_RE.match(text))
+
+
 class TTSApp(tk.Tk):
     def __init__(self):
         super().__init__()
 
         self.title("Local TTS")
-        self.geometry("560x220")
-        self.minsize(440, 200)
+        self.geometry("660x240")
+        self.minsize(540, 220)
         self.output_devices = []
         self.settings_window = None
         self.stop_event = threading.Event()
@@ -44,9 +61,13 @@ class TTSApp(tk.Tk):
         self.monitor_device_choice = tk.StringVar()
         self.engine_choice = tk.StringVar(value="neural")
         self.discord_enabled = tk.BooleanVar(value=False)
+        self.wowlink_enabled = tk.BooleanVar(value=False)
         self.monitor_enabled = tk.BooleanVar(value=False)
         self.return_was_down = False
         self.last_discord_text = ""
+        self.capture_was_enabled = scroll_lock_is_on()
+        self.wow_capture = WowKeyboardCapture()
+        self.last_wow_text = ""
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -55,14 +76,20 @@ class TTSApp(tk.Tk):
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
+        for column in range(1, 8):
+            frame.columnconfigure(column, weight=0)
 
         self.textbox = tk.Text(frame, height=5, wrap="word", undo=True)
-        self.textbox.grid(row=0, column=0, columnspan=7, sticky="nsew")
+        self.textbox.grid(row=0, column=0, columnspan=8, sticky="nsew")
         self.textbox.focus_set()
 
         self.status = tk.StringVar(value="Ready")
         status_label = ttk.Label(frame, textvariable=self.status)
         status_label.grid(row=1, column=0, sticky="w", pady=(10, 0))
+
+        self.capture_status = tk.StringVar(value="")
+        capture_status_label = ttk.Label(frame, textvariable=self.capture_status)
+        capture_status_label.grid(row=2, column=0, columnspan=8, sticky="w", pady=(4, 0))
 
         self.discord_check = ttk.Checkbutton(
             frame,
@@ -72,12 +99,20 @@ class TTSApp(tk.Tk):
         )
         self.discord_check.grid(row=1, column=1, sticky="e", padx=(8, 0), pady=(10, 0))
 
+        self.wowlink_check = ttk.Checkbutton(
+            frame,
+            text="WoWLink",
+            variable=self.wowlink_enabled,
+            command=self.toggle_wowlink_monitoring
+        )
+        self.wowlink_check.grid(row=1, column=2, sticky="e", padx=(8, 0), pady=(10, 0))
+
         self.monitor_check = ttk.Checkbutton(
             frame,
             text="Listen",
             variable=self.monitor_enabled
         )
-        self.monitor_check.grid(row=1, column=2, sticky="e", padx=(8, 0), pady=(10, 0))
+        self.monitor_check.grid(row=1, column=3, sticky="e", padx=(8, 0), pady=(10, 0))
 
         self.settings_button = ttk.Button(
             frame,
@@ -85,23 +120,25 @@ class TTSApp(tk.Tk):
             width=3,
             command=self.open_settings
         )
-        self.settings_button.grid(row=1, column=3, sticky="e", padx=(8, 0), pady=(10, 0))
+        self.settings_button.grid(row=1, column=4, sticky="e", padx=(8, 0), pady=(10, 0))
 
         self.clear_button = ttk.Button(frame, text="Clear", command=self.clear_text)
-        self.clear_button.grid(row=1, column=4, sticky="e", padx=(8, 0), pady=(10, 0))
+        self.clear_button.grid(row=1, column=5, sticky="e", padx=(8, 0), pady=(10, 0))
 
         self.stop_button = ttk.Button(frame, text="Stop", command=self.stop_speaking)
-        self.stop_button.grid(row=1, column=5, sticky="e", padx=(8, 0), pady=(10, 0))
+        self.stop_button.grid(row=1, column=6, sticky="e", padx=(8, 0), pady=(10, 0))
         self.stop_button.configure(state="disabled")
 
         self.speak_button = ttk.Button(frame, text="Speak", command=self.send_current_text)
-        self.speak_button.grid(row=1, column=6, sticky="e", padx=(8, 0), pady=(10, 0))
+        self.speak_button.grid(row=1, column=7, sticky="e", padx=(8, 0), pady=(10, 0))
 
         self.textbox.bind("<Return>", self.speak_from_enter)
         self.textbox.bind("<Shift-Return>", self.insert_newline)
         self.bind("<Escape>", self.stop_from_escape)
         self.refresh_output_devices()
         self.after(POLL_INTERVAL_MS, self.poll_discord_enter)
+        self.after(WOWLINK_POLL_INTERVAL_MS, self.poll_wowlink)
+        self.after(150, self.poll_capture_switch)
         self.after(100, self.open_settings)
 
     def get_text(self):
@@ -278,7 +315,19 @@ class TTSApp(tk.Tk):
         self.textbox.focus_set()
 
     def set_ready_status(self):
-        self.status.set("Ready (Discord on)" if self.discord_enabled.get() else "Ready")
+        enabled_sources = []
+        if self.discord_enabled.get():
+            enabled_sources.append("Discord")
+        if self.wowlink_enabled.get():
+            enabled_sources.append("WoWLink")
+
+        if enabled_sources:
+            capture_state = "live" if scroll_lock_is_on() else "paused"
+            self.status.set("Ready")
+            self.capture_status.set(f"{', '.join(enabled_sources)} armed; Scroll Lock {capture_state}")
+        else:
+            self.status.set("Ready")
+            self.capture_status.set("")
 
     def set_speaking(self, speaking):
         self.speak_button.configure(state="normal")
@@ -308,16 +357,62 @@ class TTSApp(tk.Tk):
         self.last_discord_text = ""
         self.set_ready_status()
 
+    def toggle_wowlink_monitoring(self):
+        if not self.wowlink_enabled.get():
+            self.set_ready_status()
+            return
+
+        try:
+            self.get_selected_output_device_index()
+            self.get_selected_engine()
+        except RuntimeError as exc:
+            self.wowlink_enabled.set(False)
+            self.show_error(exc)
+            return
+
+        self.wow_capture.reset()
+        self.last_wow_text = ""
+        self.set_ready_status()
+
+    def capture_is_live(self):
+        return scroll_lock_is_on()
+
+    def poll_capture_switch(self):
+        try:
+            capture_is_enabled = self.capture_is_live()
+            if capture_is_enabled != self.capture_was_enabled:
+                self.capture_was_enabled = capture_is_enabled
+                self.return_was_down = return_key_is_down()
+                if not capture_is_enabled:
+                    self.wow_capture.reset()
+                self.set_ready_status()
+        finally:
+            self.after(150, self.poll_capture_switch)
+
     def poll_discord_enter(self):
         try:
             is_down = return_key_is_down()
             pressed_now = is_down and not self.return_was_down
             self.return_was_down = is_down
 
-            if self.discord_enabled.get() and pressed_now and discord_is_foreground():
+            if (
+                self.capture_is_live()
+                and self.discord_enabled.get()
+                and pressed_now
+                and discord_is_foreground()
+            ):
                 self.speak_focused_discord_text()
         finally:
             self.after(POLL_INTERVAL_MS, self.poll_discord_enter)
+
+    def poll_wowlink(self):
+        try:
+            if self.capture_is_live() and self.wowlink_enabled.get() and wow_is_foreground():
+                self.speak_new_wowlink_messages()
+            else:
+                self.wow_capture.reset()
+        finally:
+            self.after(WOWLINK_POLL_INTERVAL_MS, self.poll_wowlink)
 
     def speak_focused_discord_text(self):
         try:
@@ -329,14 +424,27 @@ class TTSApp(tk.Tk):
 
         if not text:
             self.status.set("Discord Enter seen; textbox text was not exposed")
+            self.refresh_capture_status()
             return
 
         if text == self.last_discord_text:
             return
 
         self.last_discord_text = text
+        if starts_with_url(text):
+            self.status.set("Discord URL skipped")
+            self.refresh_capture_status()
+            return
+
         self.enqueue_speech(text)
 
+    def speak_new_wowlink_messages(self):
+        for text in self.wow_capture.poll():
+            if not text or text == self.last_wow_text:
+                continue
+
+            self.last_wow_text = text
+            self.enqueue_speech(text)
 
     def speak_from_enter(self, _event):
         self.send_current_text()
@@ -443,6 +551,20 @@ class TTSApp(tk.Tk):
             self.status.set(f"Speaking... {queued_count} queued")
         else:
             self.status.set("Speaking...")
+
+    def refresh_capture_status(self):
+        enabled_sources = []
+        if self.discord_enabled.get():
+            enabled_sources.append("Discord")
+        if self.wowlink_enabled.get():
+            enabled_sources.append("WoWLink")
+
+        if not enabled_sources:
+            self.capture_status.set("")
+            return
+
+        capture_state = "live" if scroll_lock_is_on() else "paused"
+        self.capture_status.set(f"{', '.join(enabled_sources)} armed; Scroll Lock {capture_state}")
 
     def show_error(self, exc):
         self.status.set("Error")
